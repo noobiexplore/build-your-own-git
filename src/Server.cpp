@@ -1,10 +1,82 @@
 #include <iostream>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <string>
 
-#include "zstr/zstr.hpp"
+#include <zlib.h>
 #include "sha1.hpp"
+
+std::string readFileToString(const std::string& filename) {
+    std::ifstream file(filename, std::ios::in | std::ios::binary);
+    if (!file) {
+        std::cerr << "Error opening file: " << filename << std::endl;
+        return "";
+    }
+
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    file.close();
+    return buffer.str();
+}
+
+int writeStringToFile(const std::string& filename, const std::string& out_str) {
+    std::ofstream file(filename, std::ios::out | std::ios::binary);
+    if (!file) {
+        std::cerr << "Error opening file for writing: " << filename << std::endl;
+        return 1;
+    }
+
+    file.write(out_str.data(), out_str.size());
+    file.close();
+
+    return 0;
+}
+
+void compressString(const std::string& uncompressed, std::string& compressed) {
+    uLong sourceLen = uncompressed.length();
+    uLong destLen = compressBound(sourceLen);
+
+    Bytef* compressedData = new unsigned char[destLen];
+
+    int status = compress(compressedData, &destLen, (Bytef*)(uncompressed.c_str()), sourceLen);
+
+    if (status != Z_OK) {
+        std::cerr << "Compression failed with an error code: " << status << std::endl;
+        delete [] compressedData;
+        return;
+    }
+
+    compressed.assign(reinterpret_cast<char*>(compressedData), destLen);
+
+    delete [] compressedData;
+
+    return;
+}
+
+void uncompressString(const std::string& compressed, std::string& uncompressed, uLong originalLength) {
+    uLong destLen = originalLength;
+    Bytef* uncompressedData = new Bytef[destLen];
+
+    int status;
+    while ((status = uncompress(uncompressedData, &destLen, (Bytef*)(compressed.c_str()), compressed.length()))
+        == Z_BUF_ERROR) {
+        delete [] uncompressedData;
+        destLen *= 2;
+        uncompressedData = new Bytef[destLen];
+    }
+
+    if (status != Z_OK) {
+        std::cerr << "Decompression Failed with an error code: " << status << std::endl;
+        delete [] uncompressedData;
+        return;
+    }
+
+    uncompressed.assign(reinterpret_cast<char*>(uncompressedData), destLen);
+
+    delete [] uncompressedData;
+    return;
+}
 
 int main(int argc, char *argv[])
 {
@@ -36,7 +108,8 @@ int main(int argc, char *argv[])
             std::cerr << e.what() << '\n';
             return EXIT_FAILURE;
         }
-    } else if(command == "cat-file") {
+
+    } else if (command == "cat-file") {
         if (argc <= 3) {
             std::cerr << "Usage: path/to/your_git.sh cat-file -flag <SHA1>" << std::endl;
             return EXIT_FAILURE;
@@ -52,78 +125,68 @@ int main(int argc, char *argv[])
         std::string obj_full_sha = argv[3];
         std::string obj_dir = obj_full_sha.substr(0, 2);
         std::string obj_sha = obj_full_sha.substr(2);
+        std::string obj_name = ".git/objects/" + obj_dir + "/" + obj_sha;
 
-        std::string obj_path = ".git/objects/" + obj_dir + "/" + obj_sha;
-
-        zstr::ifstream obj_file (obj_path, std::ios::binary);
-        if (!obj_file.is_open()) {
-            std::cerr << "Couldn't open the object file\n";
-            return EXIT_FAILURE;
-        }
-
-        // Separate the type and byte size from the content
-        char ch;
-        while(obj_file.get(ch))
-            if (ch == '\0') break;
-
-        if (ch != '\0') {
-            std::cerr << "No NULL character found in the blob object file\n";
-            return EXIT_FAILURE;
-        }
+        // Uncompressing the blob object file
+        std::string compressed_blob = readFileToString(obj_name);
+        std::string uncompressed_blob;
+        // Initila length guess: four times compressed length
+        uncompressString(compressed_blob, uncompressed_blob, compressed_blob.length() * 4);
         
-        // Dealt with file contents upto '\0'. Now the rest
-        std::string obj_contents{std::istreambuf_iterator<char>(obj_file),
-                            std::istreambuf_iterator<char>()};
-        std::cout << obj_contents;
-        obj_file.close();
+        // Find the NULL character
+        size_t nullPos = uncompressed_blob.find('\0');
+        if (nullPos == std::string::npos) {
+            std::cerr << "Invalid git blob format: no null character found\n";
+            return EXIT_FAILURE;
+        }
+        // Separating header from the rest
+        std::string blob_content = uncompressed_blob.substr(nullPos + 1);
+
+        std::cout << blob_content;
 
     } else if (command == "hash-object") {
         if (argc <= 3) {
             std::cerr << "Usage: path/to/your_git hash-object -w <text-file>\n";
             return EXIT_FAILURE;
         }
-        std::string hash_flag = argv[2];
+        std::string hashFlag = argv[2];
         
-        if (hash_flag != "-w") {
+        if (hashFlag != "-w") {
             std::cerr << "Invalid hash-object flag: expected `-w`\n";
             return EXIT_FAILURE;
         }
 
         // Read the file content to a string
-        std::string file_path = argv[3];
-        std::ifstream content_file (file_path, std::ios::binary);
-        if (!content_file) {
-            std::cerr << "Failed to open the content file\n";
-            return EXIT_FAILURE;
-        }
-        std::string file_contents((std::istreambuf_iterator<char>(content_file)), 
-                            std::istreambuf_iterator<char>());
+        std::string fileName = argv[3];
+        std::string fileContents = readFileToString(fileName);
 
         // SHA1 calculation and printing
-        SHA1 content_file_sha;
-        content_file_sha.update(file_contents);
-        std::string file_sha = content_file_sha.final();
-        std::cout << file_sha << std::endl;
+        SHA1 contentSha;
+        contentSha.update(fileContents);
+        std::string finalSha = contentSha.final();
+        std::cout << finalSha << std::endl;
 
         // Creating hash object directory
-        std::string hash_dir = file_sha.substr(0, 2);
-        std::string hash_obj_file = file_sha.substr(2);
-        std::string hash_dir_path = ".git/objects/" + hash_dir;
-        std::string hash_obj_path = ".git/objects/" + hash_dir + "/" + hash_obj_file;
-        std::filesystem::create_directory(hash_dir_path);
+        std::string hashDirectoryName = finalSha.substr(0, 2);
+        std::string hashObjectName = finalSha.substr(2);
+        std::string hashDirectoryPath = ".git/objects/" + hashDirectoryName;
+        std::string hashObjectPath = ".git/objects/" + hashDirectoryName + "/" + hashObjectName;
+        std::filesystem::create_directory(hashDirectoryPath);
 
-        std::string header = "blob " + std::to_string(file_contents.size()) + '\0';
-        std::string object_file = header + file_contents;
+        // Make the object file: header + content
+        std::string header = "blob " + std::to_string(fileContents.size()) + '\0';
+        std::string objectContent = header + fileContents;
 
-        // Creating hash object zlib compressed output file
-        zstr::ofstream hash_file (hash_obj_path);
-        if (hash_file) {
-            hash_file << object_file;
-        } else {
-            std::cerr << "Failure: Couldn't create hash object file\n";
+        // Compress the object file
+        std::string compressedObjectContent;
+        compressString(objectContent, compressedObjectContent);
+
+        int st = writeStringToFile(hashObjectPath, compressedObjectContent);
+        if (st != 0) {
+            std::cerr << "Couldn't open hash-object file for writing\n";
             return EXIT_FAILURE;
         }
-        content_file.close();
+
     } else {
         std::cerr << "Unknown command " << command << '\n';
         return EXIT_FAILURE;
