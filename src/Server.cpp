@@ -87,7 +87,7 @@ public:
 
     GitObject(std::string sha1) : objectSHA(sha1) {}
 
-    bool objectFileToString(std::string& uncompressedObjectString) {
+    bool objectFileToString(std::string& uncompressedObject, std::string& objectType) {
         std::string objectDirectory = objectSHA.substr(0, 2);
         std::string objectFileName = objectSHA.substr(2);
         std::string objectFilePath = ".git/objects/" + objectDirectory + "/" + objectFileName;
@@ -96,19 +96,36 @@ public:
         std::string compressedObject = readFileToString(objectFilePath);
         if (compressedObject.empty()) return false;
         // Initila length guess: four times compressed length
-        if(!uncompressString(compressedObject, uncompressedObjectString, compressedObject.length() * 4)) {
+        if(!uncompressString(compressedObject, uncompressedObject, compressedObject.length() * 4)) {
             return false;
         }
 
         // Find the type of the object and handle type error
-        size_t firstSpace = uncompressedObjectString.find(' ');
-        objectType = uncompressedObjectString.substr(0, firstSpace);
+        size_t firstSpace = uncompressedObject.find(' ');
+        objectType = uncompressedObject.substr(0, firstSpace);
+        this->objectType = objectType;
         if (objectType != "tree" && objectType != "blob") {
             std::cerr << "fatal error: Invalid object type\n";
             return false;
         }
 
         return true;
+    }
+
+    // Raw hex bytes to hex string
+    std::string toHex(const uint8_t* buffer, size_t length) {
+        std::ostringstream ostream;
+        for (size_t i = 0; i < length; i++) {
+            ostream << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(buffer[i]);
+        }
+        return ostream.str();
+
+        /*
+        for (size_t i = 0; i < length; i++) {
+            printf("%02x", (int)buffer[i]);
+        }
+        printf("\n");
+        */
     }
 };
 
@@ -120,8 +137,6 @@ private:
     std::string flag;
 
 public:
-    GitCommand(std::string command, std::string flag, const int argc)
-        : command(command), flag(flag), argc(argc) {}
     GitCommand(std::string command, const int argc)
         : command(command), argc(argc) {}
 
@@ -155,6 +170,7 @@ public:
             return false;
         }
 
+        flag = argv[2];
         if (flag != "-p") {
             std::cerr << "Invalid cat-file flag: expected `-p`" << std::endl;
             return false;
@@ -166,9 +182,9 @@ public:
             return false;
         }
 
-        std::string uncompressedObject;
+        std::string uncompressedObject, objectType;
         GitObject gitObject(objectSHA);
-        gitObject.objectFileToString(uncompressedObject);
+        gitObject.objectFileToString(uncompressedObject, objectType);
 
         // Find the NULL character
         size_t nullPos = uncompressedObject.find('\0');
@@ -184,14 +200,89 @@ public:
 
     bool lsTree(char* argv[], std::string& lsTreeString) {
         if (argc < 3) {
-            std::cerr << "Usage: path/to/your_git.sh ls-tree(optional) --nameonly <SHA1 hash>\n";
+            std::cerr << "Usage: path/to/your_git.sh ls-tree --nameonly(optional) <SHA1 hash>\n";
             return false;
         }
 
-        std::string objectSHA = argv[3];
+        std::string objectSHA;
+        if (argc == 4) {
+            flag = argv[2];
+            objectSHA = argv[3];
+        } else if (argc == 3) {
+            objectSHA = argv[2];
+        } else {
+            std::cerr << "Usage: path/to/your_git.sh ls-tree --nameonly(optional) <SHA1 hash>\n";
+            return false;
+        }
+
         if (objectSHA.length() != 40) {
             std::cerr << "fatal: Not a valid object name " << objectSHA << ". Expected 40 hex characters\n";
             return false;
+        }
+
+        std::string uncompressedObject, objectType;
+        GitObject gitObject(objectSHA);
+        gitObject.objectFileToString(uncompressedObject, objectType);
+
+        if (objectType != "tree") {
+            std::cerr << "fatal: Not a tree object\n";
+            return false;
+        }
+
+        // Find the NULL character
+        size_t nullPos = uncompressedObject.find('\0');
+        if (nullPos == std::string::npos) {
+            std::cerr << "Invalid git tree format: no null character found\n";
+            return false;
+        }
+        // Separating header from the rest
+        lsTreeString = uncompressedObject.substr(nullPos + 1);
+        while (lsTreeString.size() > 0) {
+            // Parsing file mode
+            size_t firstSpace = lsTreeString.find(' ');
+            std::string modeNumber = lsTreeString.substr(0, firstSpace);
+            std::string mode;
+
+            if (modeNumber != "40000" && modeNumber != "100755") {
+                std::cerr << "Invalid object mode number in tree object file\n";
+                return false;
+            } else if (modeNumber == "40000") {
+                modeNumber = "040000";
+                mode = "tree";
+            } else {
+                mode = "blob";
+            }
+            // Done with upto file mode
+            lsTreeString = lsTreeString.substr(firstSpace+1);
+
+            // Parsing file/folder name
+            nullPos = lsTreeString.find('\0');
+            std::string name = lsTreeString.substr(0, nullPos);
+            // Done with upto file name
+            lsTreeString = lsTreeString.substr(nullPos+1);
+
+            // Now parsing raw 20 byte SHA1 hash of the object
+            size_t hexBufferSize = 20;
+            uint8_t hexBuffer[hexBufferSize];
+            if (lsTreeString.size() < hexBufferSize) {
+                std::cerr << "Invalid tree object file format\n";
+                return false;
+            }
+            std::copy(lsTreeString.begin(), lsTreeString.begin() + hexBufferSize, hexBuffer);
+            std::string hexString = gitObject.toHex(hexBuffer, hexBufferSize);
+
+            // Dealt with one object, onto the next in next iteration
+            lsTreeString = lsTreeString.substr(hexBufferSize);
+
+            // Output object info in a line
+            if (!flag.empty() && flag != "--name-only") {
+                std::cerr << "Usage: path/to/your_git.sh ls-tree --nameonly(optional) <SHA1 hash>\n";
+                return false;
+            } else if (flag == "--name-only") {
+                std::cout << name << std::endl;
+            } else {
+                std::cout << modeNumber + " " + mode + " " + hexString + "    " + name << std::endl;
+            }
         }
 
         return true;
@@ -217,11 +308,7 @@ int main(int argc, char *argv[])
     }
 
     std::string cmd = argv[1];
-
-    std::string flag;
-    if (argv[2]) flag = argv[2];
-
-    GitCommand gitCommand(cmd, flag, argc);
+    GitCommand gitCommand(cmd, argc);
 
     if (cmd == "init") {
         if (!gitCommand.initGit())
