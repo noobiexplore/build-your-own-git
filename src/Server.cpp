@@ -9,35 +9,31 @@
 
 
 
-bool readFileToString(const std::string& filename, std::string& fileString) {
-    std::ifstream file(filename, std::ios::in | std::ios::binary);
-    if (!file) {
-        std::cerr << "Error opening file: " << filename << std::endl;
-        return false;
+std::string readFileToString(const std::string& fileName) {
+    std::ifstream file(fileName, std::ios::in | std::ios::binary);
+    if (!file.is_open()) {
+        throw std::runtime_error("Failed to open '" + fileName + 
+                                 "' for reading. No such file or directory");
     }
 
     std::stringstream buffer;
     buffer << file.rdbuf();
-    file.close();
-    fileString =  buffer.str();
 
-    return true;
+    file.close();
+    return buffer.str();
 }
 
-bool writeStringToFile(const std::string& filename, const std::string& out_str) {
-    std::ofstream file(filename, std::ios::out | std::ios::binary);
-    if (!file) {
-        std::cerr << "Error opening object file for writing: " << filename << std::endl;
-        return false;
+void writeStringToFile(const std::string& fileName, const std::string& out_str) {
+    std::ofstream file(fileName, std::ios::out | std::ios::binary);
+    if (!file.is_open()) {
+        throw std::runtime_error("Failed to open object file for writing: " + fileName);
     }
 
     file.write(out_str.data(), out_str.size());
     file.close();
-
-    return true;
 }
 
-bool compressString(const std::string& uncompressed, std::string& compressed) {
+void compressString(const std::string& uncompressed, std::string& compressed) {
     uLong sourceLen = uncompressed.length();
     uLong destLen = compressBound(sourceLen);
 
@@ -46,19 +42,16 @@ bool compressString(const std::string& uncompressed, std::string& compressed) {
     int status = compress(compressedData, &destLen, (Bytef*)(uncompressed.c_str()), sourceLen);
 
     if (status != Z_OK) {
-        std::cerr << "Compression failed with an error code: " << status << std::endl;
         delete [] compressedData;
-        return false;
+        throw std::runtime_error("Compression failed with error code" + std::to_string(status));
     }
 
     compressed.assign(reinterpret_cast<char*>(compressedData), destLen);
 
     delete [] compressedData;
-
-    return true;
 }
 
-bool uncompressString(const std::string& compressed, std::string& uncompressed, uLong originalLength) {
+void uncompressString(const std::string& compressed, std::string& uncompressed, uLong originalLength) {
     uLong destLen = originalLength;
     Bytef* uncompressedData = new Bytef[destLen];
 
@@ -71,64 +64,73 @@ bool uncompressString(const std::string& compressed, std::string& uncompressed, 
     }
 
     if (status != Z_OK) {
-        std::cerr << "Decompression Failed with an error code: " << status << std::endl;
         delete [] uncompressedData;
-        return false;
+        throw std::runtime_error("Decompression Failed with an error code: " + std::to_string(status));
     }
 
     uncompressed.assign(reinterpret_cast<char*>(uncompressedData), destLen);
 
     delete [] uncompressedData;
-    return true;
 }
 
-class GitObjectUtil {
+class GitObjectUtility {
 public:
     std::string objectSHA;
     std::string objectType;
 
-    GitObjectUtil(std::string sha1) : objectSHA(sha1) {}
+    GitObjectUtility(std::string sha1) : objectSHA(sha1) {}
 
-    bool objectFileToString(std::string& uncompressedObject, std::string& objectType) {
+    std::string objectFileToString() {
         std::string objectDirectory = objectSHA.substr(0, 2);
         std::string objectFileName = objectSHA.substr(2);
         std::string objectFilePath = ".git/objects/" + objectDirectory + "/" + objectFileName;
 
         // Uncompressing the object file
         std::string compressedObject;
-        if(!readFileToString(objectFilePath, compressedObject)) return false;
+        try {
+            compressedObject = readFileToString(objectFilePath);
+        } catch (std::runtime_error& e) {
+            throw std::runtime_error("fatal: Invalid object name " + objectSHA + 
+                                        ". No such object in .git/object directory");
+        } catch (std::exception& e) {
+            throw;
+        }
+
         // Initila length guess: four times compressed length
-        if(!uncompressString(compressedObject, uncompressedObject, compressedObject.length() * 4)) {
-            return false;
+        std::string uncompressedObject;
+        try {
+            uncompressString(compressedObject, uncompressedObject, compressedObject.length() * 4);
+        } catch (std::runtime_error& e) {
+            std::cerr << e.what() << std::endl;
+            throw;
+        } catch (std::exception& e) {
+            std::cerr << "Unexpected error: " << e.what() << std::endl;
+            throw;
         }
 
         // Find the type of the object and handle type error
         size_t firstSpace = uncompressedObject.find(' ');
         objectType = uncompressedObject.substr(0, firstSpace);
-        this->objectType = objectType;
-        if (objectType != "tree" && objectType != "blob") {
-            std::cerr << "fatal error: Invalid object type\n";
-            return false;
-        }
+        if (objectType != "tree" && objectType != "blob")
+            throw std::runtime_error("fatal error: Invalid object type");
 
-        return true;
+        return uncompressedObject;
     }
 
-    bool createObjectDirectory(std::string& objectName) {
+    std::string createObjectDirectory(const std::string objectSHA) {
         // 40 character SHA1 hash. First two characters are object directory name
         // Last 38 character is the object file name
         std::string objectDirName = ".git/objects/" + objectSHA.substr(0, 2);
-        objectName = objectDirName + "/" + objectSHA.substr(2);
+        std::string objectPath = objectDirName + "/" + objectSHA.substr(2);
     
         try {
             std::filesystem::create_directory(objectDirName);
         } catch (const std::filesystem::filesystem_error& e) {
-            std::cout << "Couldn't create directory\n";
-            std::cerr << e.what() << '\n';
-            return false;
+            std::cerr << "Couldn't create directory\n" << e.what() << std::endl;
+            throw;
         }
 
-        return true;
+        return objectPath;
     }
 
     // Raw hex bytes to hex string
@@ -155,12 +157,19 @@ private:
 public:
     Blob(std::string fileName): fileName(fileName) {}
 
-    bool createBlobObject(void) {
+    void createBlobObject(void) {
+        // Read file content
         std::string fileContent;
-        if(!readFileToString(fileName, fileContent)) 
-            return false;
+        try {
+            fileContent = readFileToString(fileName);
+        } catch (std::runtime_error& e) {
+            std::cerr << "fatal: ";
+            throw;
+        } catch (std::exception& e) {
+            throw;
+        }
 
-        // Create header and blob file
+        // Create header and blob object file content
         std::string header = "blob " + std::to_string(fileContent.size()) + '\0';
         std::string blobContent = header + fileContent;
 
@@ -169,27 +178,39 @@ public:
         hash.update(blobContent);
         std::string hashString = hash.final();
 
-        GitObjectUtil gitObject(hashString);
+        GitObjectUtility gitObjectUtility(hashString);
 
         // Create object directory
-        std::string blobName;
-        if (!gitObject.createObjectDirectory(blobName)) 
-            return false;
-
+        std::string blobPath;
+        try {
+            blobPath = gitObjectUtility.createObjectDirectory(hashString);
+        } catch (std::filesystem::filesystem_error& e) {
+            throw;
+        } catch (std::exception& e) {
+            throw;
+        }
 
         // Compress the blob file
         std::string compressedBlob;
-        if (!compressString(blobContent, compressedBlob)) 
-            return false;
+        try {
+            compressString(blobContent, compressedBlob);
+        } catch (std::runtime_error& e) {
+            throw;
+        } catch (std::exception& e) {
+            throw;
+        }
 
         // Write the compressed string to object file
-        if (!writeStringToFile(blobName, compressedBlob)) 
-            return false;
+        try {
+            writeStringToFile(blobPath, compressedBlob);
+        } catch (std::runtime_error& e) {
+            throw;
+        } catch (std::exception& e) {
+            throw;
+        }
 
         // Print out the SHA1 hash
         std::cout << hashString << std::endl;
-
-        return true;
     }
 };
 
@@ -213,7 +234,7 @@ public:
     GitCommand(std::string command, const int argc)
         : command(command), argc(argc) {}
 
-    bool initGit(void) {
+    void initGit(void) {
         try {
             std::filesystem::create_directory(".git");
             std::filesystem::create_directory(".git/objects");
@@ -224,61 +245,61 @@ public:
                 headFile << "ref: refs/heads/main\n";
                 headFile.close();
             } else {
-                std::cerr << "Failed to create .git/HEAD file.\n";
-                return false;
+                throw std::runtime_error("Failed to create .git/HEAD file");
             }
             std::cout << "Initialized git directory\n";
 
         } catch (const std::filesystem::filesystem_error& e) {
-            std::cout << "Couldn't create directory\ne";
+            std::cout << "Couldn't create directory\n";
             std::cerr << e.what() << '\n';
-            return false;
+            throw;
+        } catch (std::runtime_error& e) {
+            std::cerr << e.what() << std::endl;
+            throw;
+        } catch (std::exception& e) {
+            std::cerr << "Unexpected error: " << e.what() << std::endl;
+            throw;
         }
-        return true;
     }
 
-    bool catFile(char* argv[]) {
-        if (argc <= 3) {
-            std::cerr << "Usage: path/to/your_git.sh cat-file -p <SHA1 hash>" << std::endl;
-            return false;
-        }
+    void catFile(char* argv[]) {
+        if (argc <= 3)
+            throw std::runtime_error("Usage: path/to/your_git.sh cat-file -p <SHA1 hash>");
 
         flag = argv[2];
-        if (flag != "-p") {
-            std::cerr << "Invalid cat-file flag: expected `-p`" << std::endl;
-            return false;
-        }
+        if (flag != "-p")
+            throw std::runtime_error("Invalid cat-file flag: expected `-p`");
 
         std::string objectSHA = argv[3];
-        if (objectSHA.length() != 40) {
-            std::cerr << "fatal: Not a valid object name " << objectSHA << ". Expected 40 hex characters\n";
-            return false;
-        }
+        if (objectSHA.length() != 40)
+            throw std::runtime_error("fatal: Not a valid object name");
 
-        std::string catString, objectType;
-        GitObjectUtil gitObject(objectSHA);
-        if (!gitObject.objectFileToString(catString, objectType))
-            return false;
+        // Create the object utility structure
+        GitObjectUtility gitObjectUtility(objectSHA);
+        // Read the object file to a string
+        std::string catString;
+        try {
+            catString = gitObjectUtility.objectFileToString();
+        } catch (std::runtime_error& e) {
+            throw;
+        } catch (std::exception& e) {
+            throw;
+        }
 
         // Find the NULL character
         size_t nullPos = catString.find('\0');
-        if (nullPos == std::string::npos) {
-            std::cerr << "Invalid git object format: no null character found\n";
-            return false;
-        }
+        if (nullPos == std::string::npos)
+            throw std::runtime_error("Invalid git object format: no null character found");
+
         // Separating header from the rest
         catString.erase(0, nullPos + 1);
         std::cout << catString;
-
-        return true;
     }
 
-    bool lsTree(char* argv[]) {
+    void lsTree(char* argv[]) {
         // Argument parsing and error handling
-        if (argc < 3) {
-            std::cerr << "Usage: path/to/your_git.sh ls-tree --nameonly(optional) <SHA1 hash>\n";
-            return false;
-        }
+        if (argc < 3)
+            throw std::runtime_error("Usage: path/to/your_git.sh ls-tree --name-only(optional) <SHA1 hash>");
 
         std::string objectSHA;
         if (argc == 4) {
@@ -287,37 +308,34 @@ public:
         } else if (argc == 3) {
             objectSHA = argv[2];
         } else {
-            std::cerr << "Usage: path/to/your_git.sh ls-tree --nameonly(optional) <SHA1 hash>\n";
-            return false;
+            throw std::runtime_error("Usage: path/to/your_git.sh ls-tree --name-only(optional) <SHA1 hash>");
         }
 
+        if (!flag.empty() && flag != "--name-only")
+            throw std::runtime_error("Usage: path/to/your_git.sh ls-tree --name-only(optional) <SHA1 hash>");
 
-        if (!flag.empty() && flag != "--name-only") {
-            std::cerr << "Usage: path/to/your_git.sh ls-tree --nameonly(optional) <SHA1 hash>\n";
-            return false;
-        }
+        if (objectSHA.length() != 40)
+            throw std::runtime_error("fatal: Not a valid object name ");
 
-        if (objectSHA.length() != 40) {
-            std::cerr << "fatal: Not a valid object name " << objectSHA << ". Expected 40 hex characters\n";
-            return false;
-        }
-
+        // Create the git object utility structure
+        GitObjectUtility gitObjectUtility(objectSHA);
         // Read object file to a string
-        std::string lsTreeString, objectType;
-        GitObjectUtil gitObject(objectSHA);
-        gitObject.objectFileToString(lsTreeString, objectType);
-
-        if (objectType != "tree") {
-            std::cerr << "fatal: Not a tree object\n";
-            return false;
+        std::string lsTreeString;
+        try {
+            lsTreeString = gitObjectUtility.objectFileToString();
+        } catch (std::runtime_error& e) {
+            throw;
+        } catch (std::exception& e) {
+            throw;
         }
+
+        if (gitObjectUtility.objectType != "tree")
+            throw std::runtime_error("fatal: Not a tree object");
 
         // Find the NULL character
         size_t nullPos = lsTreeString.find('\0');
-        if (nullPos == std::string::npos) {
-            std::cerr << "Invalid git tree format: no null character found\n";
-            return false;
-        }
+        if (nullPos == std::string::npos)
+            throw std::runtime_error("Invalid git tree format: no null character found");
 
         // Separating content from the header
         lsTreeString.erase(0, nullPos + 1);
@@ -330,8 +348,7 @@ public:
             std::string mode;
 
             if (modeNumber != "40000" && modeNumber != "100755" && modeNumber != "100644") {
-                std::cerr << "Invalid object mode number in tree object file\n";
-                return false;
+                throw std::runtime_error("Invalid object mode number in tree object file");
             } else if (modeNumber == "40000") {
                 modeNumber = "040000";
                 mode = "tree";
@@ -350,47 +367,45 @@ public:
             // Now parsing raw 20 byte SHA1 hash of the object
             size_t hexBufferSize = 20;
             uint8_t hexBuffer[hexBufferSize];
-            if (lsTreeString.size() < hexBufferSize) {
-                std::cerr << "Invalid tree object file format\n";
-                return false;
-            }
+            if (lsTreeString.size() < hexBufferSize)
+                throw std::runtime_error("Invalid tree object file format");
+
             std::copy(lsTreeString.begin(), lsTreeString.begin() + hexBufferSize, hexBuffer);
-            std::string hexString = gitObject.toHex(hexBuffer, hexBufferSize);
+            std::string hexString = gitObjectUtility.toHex(hexBuffer, hexBufferSize);
 
             // Dealt with one object, onto the next in next iteration
             lsTreeString.erase(0, hexBufferSize);
 
             // Output object info in a line
-            if (flag == "--name-only") {
+            if (flag == "--name-only")
                 std::cout << name << std::endl;
-            } else {
+            else
                 std::cout << modeNumber + " " + mode + " " + hexString + "    " + name << std::endl;
-            }
         }
-
-        return true;
     }
 
-    bool hashObject(char* argv[]) {
-        if (argc <= 3) {
-            std::cerr << "Usage: path/to/your_git hash-object -w <file-name>\n";
-            return false;
-        }
+    void hashObject(char* argv[]) {
+        if (argc <= 3)
+            throw std::runtime_error("Usage: path/to/your_git hash-object -w <file-name>");
 
         flag = argv[2];
-        if (flag != "-w") {
-            std::cerr << "Invalid hash-object flag: expected `-w`\n";
-            return false;
-        }
+        if (flag != "-w")
+            throw std::runtime_error("Invalid hash-object flag: expected `-w`");
 
         // Read the file name
         std::string fileName = argv[3];
 
         // Create the blob object
         Blob blobObject(fileName);
-        if (!blobObject.createBlobObject()) return false;
-
-        return true;
+        try {
+            blobObject.createBlobObject();
+        } catch (std::filesystem::filesystem_error& e) {
+            throw;
+        } catch (std::runtime_error& e) {
+            throw;
+        } catch (std::exception& e) {
+            throw;
+        }
     }
 
     bool writeTree(char* argv[]) {
@@ -411,20 +426,51 @@ int main(int argc, char *argv[])
     GitCommand gitCommand(cmd, argc);
 
     if (cmd == "init") {
-        if (!gitCommand.initGit())
+        try {
+            gitCommand.initGit();
+        } catch (std::filesystem::filesystem_error& e) {
             return EXIT_FAILURE;
+        } catch (std::runtime_error& e) {
+            return EXIT_FAILURE;
+        } catch (std::exception& e) {
+            return EXIT_FAILURE;
+        }
 
     } else if (cmd == "cat-file") {
-        if (!gitCommand.catFile(argv))
+        try {
+            gitCommand.catFile(argv);
+        } catch (std::runtime_error& e) {
+            std::cerr << e.what() << std::endl;
             return EXIT_FAILURE;
+        } catch (std::exception& e) {
+            std::cerr << "Unexpected error: " << e.what() << std::endl;
+            return EXIT_FAILURE;
+        }
 
     } else if (cmd == "ls-tree") {
-        if (!gitCommand.lsTree(argv))
+        try {
+            gitCommand.lsTree(argv);
+        } catch (std::runtime_error& e) {
+            std::cerr << e.what() << std::endl;
             return EXIT_FAILURE;
+        } catch (std::exception& e) {
+            std::cerr << "Unexpected error: " << e.what() << std::endl;
+            return EXIT_FAILURE;
+        }
 
     } else if (cmd == "hash-object") {
-        if (!gitCommand.hashObject(argv))
+        try {
+            gitCommand.hashObject(argv);
+        } catch (std::filesystem::filesystem_error& e) {
+            std::cerr << e.what() << std::endl;
             return EXIT_FAILURE;
+        } catch (std::runtime_error& e) {
+            std::cerr << e.what() << std::endl;
+            return EXIT_FAILURE;
+        } catch (std::exception& e) {
+            std::cerr << "Unexpected error: " << e.what() << std::endl;
+            return EXIT_FAILURE;
+        }
 
     } else {
         std::cerr << "Unknown command " << cmd << '\n';
